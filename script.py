@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 import csv
 from pathlib import Path
+import unicodedata
+import re
 
 # ================================================================
 # CONFIGURAR FFMPEG LOCALMENTE
@@ -38,12 +40,11 @@ ensure_pkg("torch")
 ensure_pkg("pandas")
 ensure_pkg("numpy")
 
-# ================================================================
-# IMPORTAÇÕES
-# ================================================================
+
 from transformers import pipeline
 from sentence_transformers import SentenceTransformer, util
 import torch
+
 
 # ================================================================
 # CARREGAR MODELOS
@@ -62,12 +63,13 @@ def load_models():
     print("[INFO] Modelos carregados.\n")
     return stt, sim
 
+
 # ================================================================
 # TRANSCRIÇÃO
 # ================================================================
 def transcrever_audio(stt_model, audio_path):
     print(f"[INFO] Transcrevendo: {audio_path}")
-    
+
     resultado = stt_model(
         audio_path,
         return_timestamps=True,
@@ -79,62 +81,129 @@ def transcrever_audio(stt_model, audio_path):
     print(f"[INFO] Transcrição concluída.")
     return texto
 
+
 # ================================================================
-# CSV
+# CARREGAR CSV
 # ================================================================
-def carregar_csv(caminho="musicas.csv"):
-    print(f"[INFO] Lendo CSV: {caminho}")
+def carregar_csv_palavras(caminho="musicas.csv"):
+    print(f"[INFO] Lendo CSV de palavras: {caminho}")
     df = pd.read_csv(caminho)
     df["titulo"] = df["titulo"].str.lower()
     return df
 
-# ================================================================
-# BUSCAR LETRA
-# ================================================================
-def buscar_letra(df, nome_musica):
-    nome_musica = nome_musica.lower()
-    resultado = df[df["titulo"] == nome_musica]
 
-    if len(resultado) == 0:
+# ================================================================
+# LETRA ORIGINAL
+# ================================================================
+def montar_letra_por_palavras(df, nome_musica):
+    nome_musica = nome_musica.lower()
+    linhas = df[df["titulo"] == nome_musica]
+
+    if len(linhas) == 0:
         print(f"[ERRO] Música '{nome_musica}' não encontrada.")
         return None
 
-    return resultado.iloc[0]["letra"]
+    palavras = linhas["palavra"].tolist()
+    return palavras
+
 
 # ================================================================
-# SIMILARIDADE
+# ALINHAR
 # ================================================================
-def comparar_letras(sim_model, letra_original, letra_usuario):
-    versos_original = [v.strip() for v in letra_original.split("\n") if v.strip()]
-    versos_usuario = [v.strip() for v in letra_usuario.split("\n") if v.strip()]
+def alinhar_palavras(lista_original, lista_usuario):
+    alinhado_usuario = []
+    idx = 0
 
-    if len(versos_usuario) == 0:
-        versos_usuario = [letra_usuario]
+    for palavra in lista_original:
+        if idx < len(lista_usuario):
+            alinhado_usuario.append(lista_usuario[idx])
+            idx += 1
+        else:
+            alinhado_usuario.append("")
 
-    emb_original = sim_model.encode(versos_original, convert_to_tensor=True)
-    emb_usuario = sim_model.encode(versos_usuario, convert_to_tensor=True)
+    return alinhado_usuario
 
-    matriz_sim = util.cos_sim(emb_original, emb_usuario)
 
-    melhor_por_linha = [float(torch.max(linha)) for linha in matriz_sim]
-    media_sim = float(np.mean(melhor_por_linha))
+# ================================================================
+# NORMALIZAÇÃO
+# ================================================================
+def normalizar_texto_lista(palavras):
+    texto = " ".join(palavras)
+    texto = texto.lower()
+    texto = ''.join(c for c in unicodedata.normalize("NFD", texto) if unicodedata.category(c) != "Mn")
+    texto = re.sub(r'[^a-zA-Z0-9\s]', ' ', texto)
+    return texto.split()
 
-    return media_sim, melhor_por_linha, versos_original
+
+# ================================================================
+# DETECTAR PALAVRAS NÃO CANTADAS
+# ================================================================
+def detectar_palavras_faltantes(palavras_original, palavras_transcritas):
+    lista_original_norm = normalizar_texto_lista(palavras_original)
+    lista_transcrita_norm = normalizar_texto_lista(palavras_transcritas)
+
+    set_original = set(lista_original_norm)
+    set_transcrita = set(lista_transcrita_norm)
+
+    faltantes = [w for w in lista_original_norm if w not in set_transcrita]
+
+    cobertura = (len(set_original & set_transcrita) / len(set_original)) * 100 if len(set_original) > 0 else 0
+
+    return {
+        "cobertura": round(cobertura, 2),
+        "faltantes": faltantes,
+        "total_original": len(lista_original_norm),
+        "total_transcrito": len(lista_transcrita_norm)
+    }
+
+
+# ================================================================
+# COMPARAR PALAVRAS
+# ================================================================
+def comparar_palavras(sim_model, palavras_original, palavras_usuario):
+    emb_original = sim_model.encode(palavras_original, convert_to_tensor=True)
+
+    palavras_usuario_tratadas = [
+        p if p.strip() != "" else "[EMPTY]" for p in palavras_usuario
+    ]
+
+    emb_usuario = sim_model.encode(palavras_usuario_tratadas, convert_to_tensor=True)
+
+    matriz = util.cos_sim(emb_original, emb_usuario)
+
+    melhor_por_palavra = [
+        float(torch.max(linha)) if palavras_usuario[i].strip() != "" else 0.0
+        for i, linha in enumerate(matriz)
+    ]
+
+    media = float(np.mean(melhor_por_palavra))
+
+    return media, melhor_por_palavra
+
 
 # ================================================================
 # GERAR RELATÓRIO CSV
 # ================================================================
-def gerar_relatorio_csv(relatorio_path, versos_original, versos_usuario, scores):
+def gerar_relatorio_csv(relatorio_path, palavras_original, palavras_usuario, scores, info_faltantes):
     Path(relatorio_path).parent.mkdir(parents=True, exist_ok=True)
 
-    pares = list(zip(versos_original, versos_usuario, scores))
+    pares = list(zip(palavras_original, palavras_usuario, scores))
     pares_ordenados = sorted(pares, key=lambda x: x[2], reverse=True)
 
-    top_mais = pares_ordenados[:5]
-    top_menos = pares_ordenados[-5:]
+    top_mais = pares_ordenados[:10]
+    top_menos = pares_ordenados[-10:]
 
     with open(relatorio_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile, delimiter=";")
+
+        writer.writerow(["Cobertura (%)", info_faltantes["cobertura"]])
+        writer.writerow(["Total na letra", info_faltantes["total_original"]])
+        writer.writerow(["Total transcrito", info_faltantes["total_transcrito"]])
+        writer.writerow([])
+        writer.writerow(["Palavras não cantadas"])
+        writer.writerow(info_faltantes["faltantes"])
+        writer.writerow([])
+
         writer.writerow(["Tipo", "Original", "Usuário", "Similaridade"])
 
         for item in top_mais:
@@ -143,7 +212,15 @@ def gerar_relatorio_csv(relatorio_path, versos_original, versos_usuario, scores)
         for item in top_menos:
             writer.writerow(["MENOR", item[0], item[1], f"{item[2]:.4f}"])
 
+        writer.writerow([])
+        writer.writerow(["LISTA COMPLETA"])
+        writer.writerow(["Original", "Usuário", "Similaridade"])
+
+        for o, u, s in pares:
+            writer.writerow([o, u, f"{s:.4f}"])
+
     print(f"[OK] Relatório CSV gerado em: {relatorio_path}")
+
 
 # ================================================================
 # NOTA
@@ -151,6 +228,7 @@ def gerar_relatorio_csv(relatorio_path, versos_original, versos_usuario, scores)
 def calcular_nota(sim):
     nota = int(sim * 99)
     return max(0, min(99, nota))
+
 
 # ================================================================
 # MAIN
@@ -162,31 +240,41 @@ if __name__ == "__main__":
     ARQUIVO_AUDIO = "audios/canto.wav"
     NOME_MUSICA = "The Search"
 
-    df = carregar_csv()
-    letra_original = buscar_letra(df, NOME_MUSICA)
+    df = carregar_csv_palavras()
+    palavras_original = montar_letra_por_palavras(df, NOME_MUSICA)
 
-    if letra_original is None:
+    if palavras_original is None:
         sys.exit()
 
     texto_usuario = transcrever_audio(stt, ARQUIVO_AUDIO)
+    palavras_usuario = texto_usuario.split()
 
-    media_sim, lista_sim, versos = comparar_letras(sim, letra_original, texto_usuario)
+    palavras_usuario_alinhadas = alinhar_palavras(palavras_original, palavras_usuario)
+
+    media_sim, scores = comparar_palavras(sim, palavras_original, palavras_usuario_alinhadas)
     nota_final = calcular_nota(media_sim)
+
+    info_faltantes = detectar_palavras_faltantes(palavras_original, palavras_usuario)
 
     print("\n================= RELATÓRIO FINAL =================\n")
     print(f"Música: {NOME_MUSICA}")
     print(f"Nota geral: {nota_final}/99")
     print(f"Similaridade média: {media_sim:.3f}\n")
 
-    print("Resultados por verso:\n")
-    for verso, score in zip(versos, lista_sim):
-        print(f"- \"{verso}\" -> {score:.3f}")
+    print(f"Palavras não cantadas: {len(info_faltantes['faltantes'])}")
+    print(f"Cobertura do áudio sobre a letra: {info_faltantes['cobertura']}%\n")
+
+    print("As primeiras comparações:\n")
+
+    for o, u, sc in zip(palavras_original[:20], palavras_usuario_alinhadas[:20], scores[:20]):
+        print(f"- {o}  <>  {u if u != '' else '[NÃO CANTADA]'}  -> {sc:.3f}")
 
     print("\n====================================================\n")
 
     gerar_relatorio_csv(
-        "relatorios/feedback.csv",
-        versos_original=versos,
-        versos_usuario=[texto_usuario] * len(versos),
-        scores=lista_sim
+        "relatorios/feedback_palavras.csv",
+        palavras_original,
+        palavras_usuario_alinhadas,
+        scores,
+        info_faltantes
     )

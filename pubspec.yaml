@@ -1,0 +1,11 @@
+dependencies:
+  flutter:
+    sdk: flutter
+  # Para tocar o vídeo do YouTube
+  youtube_player_flutter: ^8.1.2 
+  # Para gravar o áudio (exige configuração nativa)
+  record: ^5.0.1 
+  # Para enviar a requisição multipart para o servidor Python
+  http: ^1.1.0 
+  # Para gerenciar caminhos de arquivos
+  path_provider: ^2.1.1
